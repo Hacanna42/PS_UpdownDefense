@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 import configparser
 import asyncio
 import random
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
 with open("apiKey.txt", "r", encoding='UTF-8') as f:
     token = f.read()
@@ -19,6 +22,36 @@ with open("apiKey.txt", "r", encoding='UTF-8') as f:
 user_timers = {}
 user_timers_start = {}
 user_solving = {}
+
+# 잠수 유저 레이팅 차감
+
+
+def decrease_rating_for_inactive_users():
+    db = create_db_connection()
+    cursor = db.cursor()
+
+    # 일주일 이상 플레이하지 않은 골드 이상 유저의 레이팅 감소
+    query = """
+    UPDATE PS_USERINFO
+    SET rating = GREATEST(1, rating - 1)
+    WHERE last_played < NOW() - INTERVAL 7 DAY
+    AND rating > 10
+    """
+
+    cursor.execute(query)
+    db.commit()
+    print(f"Rating updated for inactive users at {datetime.now()}")
+
+    cursor.close()
+    db.close()
+
+
+# 스케쥴링
+scheduler = BackgroundScheduler()
+scheduler.add_job(decrease_rating_for_inactive_users, trigger=CronTrigger(
+    hour=0, minute=0, second=0, timezone='Asia/Seoul'))
+
+scheduler.start()
 
 
 def start_timer(user_id, total_minutes):
@@ -102,19 +135,26 @@ def get_current_rating(db, discord_id):
 def update_user_info_loss(db, discord_id):
     cursor = db.cursor()
     current_rating = get_current_rating(db, discord_id)
+
+    # 한국 시간대(서울)를 설정하고 현재 날짜를 구함
+    seoul_timezone = pytz.timezone('Asia/Seoul')
+    now_in_korea = datetime.now(seoul_timezone).date()
+
     if current_rating and current_rating > 1:
         update_query = """
         UPDATE PS_USERINFO
-        SET solved = solved + 1, rating = rating - 1, now_streak = 0
+        SET solved = solved + 1, rating = rating - 1, now_streak = 0, last_played = %s
         WHERE discord_id = %s
         """
-        cursor.execute(update_query, (discord_id,))
+        # 현재 날짜와 discord_id를 함께 업데이트
+        cursor.execute(update_query, (now_in_korea, discord_id))
         db.commit()
+
+    cursor.close()
 
 
 def update_user_info_win(db, discord_id):
     cursor = db.cursor()
-
     # 현재 레이팅과 연승 기록을 가져옴
     cursor.execute(
         "SELECT rating, max_rating, now_streak, max_streak FROM PS_USERINFO WHERE discord_id = %s", (discord_id,))
@@ -123,19 +163,24 @@ def update_user_info_win(db, discord_id):
         current_rating, max_rating, now_streak, max_streak = result
         new_rating = min(current_rating + 1, 31)  # 레이팅은 최대 31로 제한
         new_now_streak = now_streak + 1
-        new_max_rating = max(
-            current_rating, max_rating) if new_rating > max_rating else max_rating
+        new_max_rating = max(new_rating, max_rating)
         new_max_streak = max(new_now_streak, max_streak)
 
-        # 데이터베이스 업데이트
+        # 한국 시간대(서울)를 설정하고 현재 날짜를 구함
+        seoul_timezone = pytz.timezone('Asia/Seoul')
+        now_in_korea = datetime.now(seoul_timezone).date()
+
+        # 데이터베이스 업데이트 (last_played 포함)
         update_query = """
         UPDATE PS_USERINFO
-        SET rating = %s, max_rating = %s, now_streak = %s, max_streak = %s, solved = solved + 1, solved_win = solved_win + 1
+        SET rating = %s, max_rating = %s, now_streak = %s, max_streak = %s, solved = solved + 1, solved_win = solved_win + 1, last_played = %s
         WHERE discord_id = %s
         """
         cursor.execute(update_query, (new_rating, new_max_rating,
-                       new_now_streak, new_max_streak, discord_id))
+                       new_now_streak, new_max_streak, now_in_korea, discord_id))
         db.commit()
+
+    cursor.close()
 
 
 # 연동 DB 함수
@@ -151,13 +196,19 @@ def insert_user_info(db, user_id, handle):  # 연동
         if cursor.fetchone():
             return "**계정과 핸들을 연결할 수 없습니다. 이미 어디선가 등록되어 있습니다. 개발자에게 문의해주세요.**"
 
+        # 한국 시간대로 현재 시간을 가져옴
+        seoul_timezone = pytz.timezone('Asia/Seoul')
+        now_in_korea = datetime.now(seoul_timezone).date()
+
         # 데이터 삽입
         query = """
         INSERT INTO PS_USERINFO
-        (discord_id, solvedac_handle, rating, max_rating, solved, solved_win, max_streak, now_streak)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        (discord_id, solvedac_handle, rating, max_rating, solved, solved_win, max_streak, now_streak, last_played)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        values = (user_id, handle, 6, 6, 0, 0, 0, 0)  # 실버 V로 초기 설정
+        today = datetime.now().strftime('%Y-%m-%d')  # 오늘 날짜를 'YYYY-MM-DD' 형식으로 변환
+        # 실버 V로 초기 설정, last_played에 오늘 날짜 추가
+        values = (user_id, handle, 6, 6, 0, 0, 0, 0, now_in_korea)
         cursor.execute(query, values)
         db.commit()
         return "**Solved.ac 계정이 연동되었습니다.**"
@@ -170,7 +221,7 @@ def insert_user_info(db, user_id, handle):  # 연동
 def get_user_info(db, discord_id):
     try:
         cursor = db.cursor()
-        query = "SELECT solvedac_handle, rating, solved, solved_win, max_rating, max_streak, now_streak FROM PS_USERINFO WHERE discord_id = %s"
+        query = "SELECT solvedac_handle, rating, solved, solved_win, max_rating, max_streak, now_streak, last_played FROM PS_USERINFO WHERE discord_id = %s"
         cursor.execute(query, (discord_id,))
         result = cursor.fetchone()
 
@@ -183,6 +234,7 @@ def get_user_info(db, discord_id):
                 "max_rating": result[4],
                 "max_streak": result[5],
                 "now_streak": result[6],
+                "last_played": result[7],
             }
         else:
             return "Solved.ac 핸들과 디스코드를 먼저 연동해주세요! **/연동**"
@@ -288,18 +340,37 @@ async def 프로필(interaction: nextcord.Interaction):
             회 = "회"
             if imdick:
                 회 += " 🔥"
-            embed.add_field(name="현재연승", value=str(
-                user_info['now_streak'])+회, inline=True)
+            embed.add_field(
+                name="현재연승", value=f"{user_info['now_streak']}{회}", inline=True)
             embed.add_field(name="시도", value=str(
                 user_info['solved']), inline=True)
             embed.add_field(name="승리", value=str(
                 user_info['solved_win']), inline=True)
             embed.add_field(name="최고기록", value=get_rank_from_rating(
                 max_rating_value), inline=True)
-            embed.add_field(name="최고연승", value=str(
-                user_info['max_streak'])+"회", inline=True)
+            embed.add_field(
+                name="최고연승", value=f"{user_info['max_streak']}회", inline=True)
 
-            # 필요한 경우 더 많은 필드를 추가할 수 있습니다.
+            # '최근 플레이' 정보와 레이팅 차감 경고 추가
+            seoul_timezone = pytz.timezone('Asia/Seoul')
+            last_played_date = user_info["last_played"]
+            if last_played_date:
+                last_played_formatted = last_played_date.strftime("%Y-%m-%d")
+                # 레이팅 차감까지 남은 일수 계산
+                days_since_last_played = (datetime.now(
+                    seoul_timezone).date() - last_played_date).days
+                days_until_deduction = 7 - days_since_last_played
+
+                if rating_value >= 11 and days_until_deduction <= 3:
+                    if days_until_deduction > 0:
+                        last_played_formatted += f" ({days_until_deduction}일 남음)"
+                    else:
+                        last_played_formatted += f" **(내일 강등)**"
+
+                embed.add_field(
+                    name="최근 플레이", value=last_played_formatted, inline=True)
+            else:
+                embed.add_field(name="최근 플레이", value="정보 없음", inline=True)
 
             # 임베드를 포함한 메시지 전송
             await interaction.send(embed=embed)
@@ -522,9 +593,9 @@ async def 순위(interaction: nextcord.Interaction):
     cursor = db.cursor()
 
     query = """
-    SELECT solvedac_handle, rating, max_streak, solved, solved_win
+    SELECT solvedac_handle, rating, max_rating, max_streak, solved, solved_win
     FROM PS_USERINFO
-    ORDER BY rating DESC
+    ORDER BY rating DESC, max_rating DESC, max_streak DESC
     """
     cursor.execute(query)
     rows = cursor.fetchall()
@@ -538,9 +609,9 @@ async def 순위(interaction: nextcord.Interaction):
 
     # 순위 정보를 임베드 필드에 추가
     for idx, row in enumerate(rows, start=1):
-        handle, rating, max_streak, solved, solved_win = row
+        handle, rating, max_rating, max_streak, solved, solved_win = row
         rank = get_rank_from_rating(rating)
-        field_value = f"티어: **{rank}**, 최고연승: **{max_streak}회**, 시도: **{solved}**, 승리: **{solved_win}**"
+        field_value = f"티어: **{rank}**, 최고기록: **{get_rank_from_rating(max_rating)}**, 최고연승: **{max_streak}회**, 시도: **{solved}**, 승리: **{solved_win}**"
         embed.add_field(name=f"#{idx} {handle}",
                         value=field_value, inline=False)
 
@@ -591,7 +662,7 @@ async def 고수(interaction: nextcord.Interaction):
         query = """
         SELECT solvedac_handle, rating, solved, solved_win, max_rating, max_streak, now_streak
         FROM PS_USERINFO
-        ORDER BY rating DESC, solved_win DESC
+        ORDER BY rating DESC, max_rating DESC, max_streak DESC
         LIMIT 1
         """
         cursor.execute(query)
@@ -628,18 +699,18 @@ async def 고수(interaction: nextcord.Interaction):
             embed.add_field(
                 name="최고연승", value=f"{user_info['max_streak']}회", inline=True)
 
+            # 임베드와 찬양 메시지 전송
             await interaction.send(embed=embed)
+            await interaction.send(get_random_praise(user_info['solvedac_handle']))
         else:
             await interaction.send("1위 사용자 정보를 찾을 수 없습니다.")
         db.close()
     else:
         await interaction.send("데이터베이스 연결 실패.")
 
-    await interaction.send(get_random_praise(user_info['solvedac_handle']))
-
 
 @bot.slash_command(description="업다운 디펜스 도움말")
 async def 도움말(interaction: nextcord.Interaction):
-    await interaction.send("```ansi\n[1;2m[1;37m[1;36m[1;31m[1;34m업다운 디펜스에 오신 것을 환영합니다![0m[1;31m[0m[1;36m[0m[1;37m\n현재 디펜스 티어에 맞는 문제들이 랜덤하게 출제됩니다. 문제를 맞추면 승급하고, 그렇지 못하면 강등됩니다. 첫 시작 티어는 실버 V 입니다.\n\n[1;2m[1;37m/연동 (솔브닥ID)[0m[0m - 디스코드 계정과 Solved.ac 계정을 연동합니다.\n[1;2m[1;37m/프로필[0m[0m - 내 프로필을 확인합니다.\n[1;2m[1;37m/시작[0m[0m - 현재 디펜스티어에 맞는 문제가 출제됩니다. 디펜스 시작!\n[1;2m[1;37m/종료[0m[0m - 디펜스를 종료합니다. 성공/실패 여부에 따라 티어가 변동합니다.\n[1;2m[1;37m/중도포기[0m[0m - 문제 풀이 중간에 포기할 수 있습니다.\n[1;2m[1;37m/남은시간[0m[0m - 남은 시간을 확인할 수 있습니다.\n[2;37m[1;37m/순위[0m[2;37m[0m - 디펜스티어 순위를 볼 수 있습니다.\n[1;2m[1;31m/고수[0m[0m - 현재 1등의 프로필을 확인합니다.```")
+    await interaction.send("```ansi\n[1;2m[1;37m[1;36m[1;31m[1;34m업다운 디펜스에 오신 것을 환영합니다![0m[1;31m[0m[1;36m[0m[1;37m\n현재 디펜스 티어에 맞는 문제들이 랜덤하게 출제됩니다. 문제를 맞추면 승급하고, 그렇지 못하면 강등됩니다. 첫 시작 티어는 실버 V 입니다. 골드 V 이상의 유저가 일주일 이상 한 번도 플레이하지 않으면, 그다음 날부터 다시 플레이할 때까지 티어가 24시간마다 한 단계씩 강등됩니다.\n\n[1;2m[1;37m/연동 (솔브닥ID)[0m[0m - 디스코드 계정과 Solved.ac 계정을 연동합니다.\n[1;2m[1;37m/프로필[0m[0m - 내 프로필을 확인합니다.\n[1;2m[1;37m/시작[0m[0m - 현재 디펜스티어에 맞는 문제가 출제됩니다. 디펜스 시작!\n[1;2m[1;37m/종료[0m[0m - 디펜스를 종료합니다. 성공/실패 여부에 따라 티어가 변동합니다.\n[1;2m[1;37m/중도포기[0m[0m - 문제 풀이 중간에 포기할 수 있습니다.\n[1;2m[1;37m/남은시간[0m[0m - 남은 시간을 확인할 수 있습니다.\n[2;37m[1;37m/순위[0m[2;37m[0m - 디펜스티어 순위를 볼 수 있습니다.\n[1;2m[1;31m/고수[0m[0m - 현재 1등의 프로필을 확인합니다.```")
 
 bot.run(token)
